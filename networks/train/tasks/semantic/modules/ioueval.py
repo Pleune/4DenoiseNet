@@ -57,7 +57,8 @@ class iouEval:
 
     def getStats(self):
         # remove fp and fn from confusion on the ignore classes cols and rows
-        conf = self.conf_matrix.clone().double()
+        # Note: use float32 on XPU (float64 sum triggers an incompatible SYCL kernel)
+        conf = self.conf_matrix.clone().float()
         conf[self.ignore] = 0
         conf[:, self.ignore] = 0
 

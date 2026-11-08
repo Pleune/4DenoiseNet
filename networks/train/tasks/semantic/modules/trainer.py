@@ -3,7 +3,7 @@
 import datetime
 import os
 import time
-import imp
+import importlib.util
 import cv2
 import torch
 import torch.backends.cudnn as cudnn
@@ -85,9 +85,11 @@ class Trainer():
                      "best_val_iou": 0}
 
         # get the data
-        parserModule = imp.load_source("parserModule",
-                                       booger.TRAIN_PATH + '/tasks/semantic/dataset/' +
-                                       self.DATA["name"] + '/parser.py')
+        parser_path = (booger.TRAIN_PATH + '/tasks/semantic/dataset/' +
+                       self.DATA["name"] + '/parser.py')
+        spec = importlib.util.spec_from_file_location("parserModule", parser_path)
+        parserModule = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(parserModule)
         self.parser = parserModule.Parser(root=self.datadir,
                                           train_sequences=self.DATA["split"]["train"],
                                           valid_sequences=self.DATA["split"]["valid"],
@@ -128,31 +130,38 @@ class Trainer():
         self.multi_gpu = False
         self.n_gpus = 0
         self.model_single = self.model
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # XPU support: prefer xpu over cuda over cpu
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            self.device = torch.device("xpu")
+        elif torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        else:
+            self.device = torch.device("cpu")
         print("Training in device: ", self.device)
-        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
-            cudnn.benchmark = True
-            cudnn.fastest = True
-            self.gpu = True
-            self.n_gpus = 1
-            self.model.cuda()
-        if torch.cuda.is_available() and torch.cuda.device_count() > 1:
-            print("Let's use", torch.cuda.device_count(), "GPUs!")
+
+        self.gpu = self.device.type in ("cuda", "xpu")
+        self.n_gpus = 1
+        self.multi_gpu = False
+
+        if self.gpu:
+            self.model = self.model.to(self.device)
+        if self.gpu and (torch.cuda.device_count() > 1 if self.device.type == "cuda" else torch.xpu.device_count() > 1):
+            n = torch.cuda.device_count() if self.device.type == "cuda" else torch.xpu.device_count()
+            print("Let's use", n, "GPUs!")
             self.model = nn.DataParallel(self.model)  # spread in gpus
-            self.model = convert_model(self.model).cuda()  # sync batchnorm
+            self.model = convert_model(self.model).to(self.device)  # sync batchnorm
             self.model_single = self.model.module  # single model to get weight names
             self.multi_gpu = True
-            self.n_gpus = torch.cuda.device_count()
-
+            self.n_gpus = n
 
         self.criterion = nn.NLLLoss(weight=self.loss_w).to(self.device)
         self.ls = Lovasz_softmax(ignore=0).to(self.device)
         self.SoftmaxHeteroscedasticLoss = SoftmaxHeteroscedasticLoss().to(self.device)
         # loss as dataparallel too (more images in batch)
         if self.n_gpus > 1:
-            self.criterion = nn.DataParallel(self.criterion).cuda()  # spread in gpus
-            self.ls = nn.DataParallel(self.ls).cuda()
-            self.SoftmaxHeteroscedasticLoss = nn.DataParallel(self.SoftmaxHeteroscedasticLoss).cuda()
+            self.criterion = nn.DataParallel(self.criterion).to(self.device)
+            self.ls = nn.DataParallel(self.ls).to(self.device)
+            self.SoftmaxHeteroscedasticLoss = nn.DataParallel(self.SoftmaxHeteroscedasticLoss).to(self.device)
         self.optimizer = optim.SGD([{'params': self.model.parameters()}],
                                    lr=self.ARCH["train"]["lr"],
                                    momentum=self.ARCH["train"]["momentum"],
@@ -349,7 +358,10 @@ class Trainer():
 
         # empty the cache to train now
         if self.gpu:
-            torch.cuda.empty_cache()
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
+            elif self.device.type == "xpu":
+                torch.xpu.empty_cache()
 
         # switch to train mode
         model.train()
@@ -359,17 +371,17 @@ class Trainer():
             # measure data loading time
             self.data_time_t.update(time.time() - end)
             if not self.multi_gpu and self.gpu:
-                in_vol = in_vol.cuda()
-                pre_in_vol = pre_in_vol.cuda()
+                in_vol = in_vol.to(self.device)
+                pre_in_vol = pre_in_vol.to(self.device)
             if self.gpu:
-                proj_labels = proj_labels.cuda().long()
+                proj_labels = proj_labels.to(self.device).long()
 
             output = model(in_vol, pre_in_vol)
             loss_m = criterion(torch.log(output.clamp(min=1e-8)), proj_labels.long()) + self.ls(output, proj_labels.long())
 
             optimizer.zero_grad()
             if self.n_gpus > 1:
-                idx = torch.ones(self.n_gpus).cuda()
+                idx = torch.ones(self.n_gpus).to(self.device)
                 loss_m.backward(idx)
             else:
                 loss_m.backward()
@@ -471,17 +483,20 @@ class Trainer():
 
         # empty the cache to infer in high res
         if self.gpu:
-            torch.cuda.empty_cache()
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
+            elif self.device.type == "xpu":
+                torch.xpu.empty_cache()
 
         with torch.no_grad():
             end = time.time()
             for i, (in_vol, pre_in_vol, proj_mask, proj_labels, _, path_seq, path_name, _, _, _, _, _, _, _, _, _) in enumerate(val_loader):
                 if not self.multi_gpu and self.gpu:
-                    in_vol = in_vol.cuda()
-                    proj_mask = proj_mask.cuda()
-                    pre_in_vol = pre_in_vol.cuda()
+                    in_vol = in_vol.to(self.device)
+                    proj_mask = proj_mask.to(self.device)
+                    pre_in_vol = pre_in_vol.to(self.device)
                 if self.gpu:
-                    proj_labels = proj_labels.cuda(non_blocking=True).long()
+                    proj_labels = proj_labels.to(self.device, non_blocking=True).long()
 
                 # compute output
                 output = model(in_vol, pre_in_vol)

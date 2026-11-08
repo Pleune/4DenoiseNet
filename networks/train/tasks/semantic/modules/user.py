@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.backends.cudnn as cudnn
-import imp
+import importlib.util
 import yaml
 import time
 from PIL import Image
@@ -31,9 +31,10 @@ class User():
     self.mc = mc
 
     # get the data
-    parserModule = imp.load_source("parserModule",
-                                   booger.TRAIN_PATH + '/tasks/semantic/dataset/' +
-                                   self.DATA["name"] + '/parser.py')
+    parser_path = booger.TRAIN_PATH + '/tasks/semantic/dataset/' + self.DATA["name"] + '/parser.py'
+    spec = importlib.util.spec_from_file_location("parserModule", parser_path)
+    parserModule = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(parserModule)
     self.parser = parserModule.Parser(root=self.datadir,
                                       train_sequences=self.DATA["split"]["train"],
                                       valid_sequences=self.DATA["split"]["valid"],
@@ -56,20 +57,24 @@ class User():
         self.model = NN(self.parser.get_n_classes(), ARCH)
         #self.model = nn.DataParallel(self.model)
         w_dict = torch.load(modeldir + "/FourDenoiseNet_valid_best",
-                            map_location=lambda storage, loc: storage)
+                            map_location=lambda storage, loc: storage,
+                            weights_only=False)
         self.model.load_state_dict(w_dict['state_dict'], strict=True)
 
     
     # GPU?
     self.gpu = False
     self.model_single = self.model
-    self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+      self.device = torch.device("xpu")
+    elif torch.cuda.is_available():
+      self.device = torch.device("cuda")
+    else:
+      self.device = torch.device("cpu")
     print("Infering in device: ", self.device)
-    if torch.cuda.is_available() and torch.cuda.device_count() > 0:
-      cudnn.benchmark = True
-      cudnn.fastest = True
+    if self.device.type in ("cuda", "xpu"):
       self.gpu = True
-      self.model.cuda()
+      self.model = self.model.to(self.device)
 
   def infer(self):
     cnn = []
@@ -125,17 +130,20 @@ class User():
         path_name = path_name[0]
 
         if self.gpu:
-          proj_in = proj_in.cuda()
-          pre_proj_in = pre_proj_in.cuda()
-          p_x = p_x.cuda()
-          p_y = p_y.cuda()
+          proj_in = proj_in.to(self.device)
+          pre_proj_in = pre_proj_in.to(self.device)
+          p_x = p_x.to(self.device)
+          p_y = p_y.to(self.device)
           
         #compute output
         end = time.time()
         proj_output = self.model(proj_in, pre_proj_in)
         proj_argmax = proj_output[0].argmax(dim=0)
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+        if self.gpu:
+            if self.device.type == "cuda":
+                torch.cuda.synchronize()
+            elif self.device.type == "xpu":
+                torch.xpu.synchronize()
         res = time.time() - end
         print("Network seq", path_seq, "scan", path_name,
               "in", res, "sec")

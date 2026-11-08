@@ -1,6 +1,6 @@
 # !/usr/bin/env python3
 # This file is covered by the LICENSE file in the root of this project.
-import imp
+
 from traceback import print_tb
 
 import __init__ as booger

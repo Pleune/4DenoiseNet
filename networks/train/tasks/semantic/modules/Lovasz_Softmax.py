@@ -19,7 +19,7 @@ copies or substantial portions of the Software.
 """
 import torch
 import torch.nn as nn
-from torch.autograd import Variable
+# Variable is no longer needed (tensors support autograd natively)
 
 
 try:
@@ -109,11 +109,11 @@ def lovasz_softmax_flat(probas, labels, classes='present'):
             class_pred = probas[:, 0]
         else:
             class_pred = probas[:, c]
-        errors = (Variable(fg) - class_pred).abs()
+        errors = (fg - class_pred).abs()
         errors_sorted, perm = torch.sort(errors, 0, descending=True)
         perm = perm.data
         fg_sorted = fg[perm]
-        losses.append(torch.dot(errors_sorted, Variable(lovasz_grad(fg_sorted))))
+        losses.append(torch.dot(errors_sorted.cpu(), lovasz_grad(fg_sorted.cpu())).to(fg.device))
     return mean(losses)
 
 
